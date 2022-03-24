@@ -2,10 +2,10 @@
 
 module Main ( main ) where
 
-import           Alphabet
-import           Control.Concurrent
+import           Alphabet                      (incrementWord)
+import           Control.Concurrent            (ThreadId, forkIO, killThread)
 import qualified Control.Logging               as L
-import           Control.Monad
+import           Control.Monad                 (forM_)
 import qualified Crypto.Hash.MD5               as MD5
 import qualified Data.ByteString               as B
 import           Data.Char                     (ord)
@@ -16,29 +16,50 @@ import qualified Network.WebSockets            as WS
 import           Network.WebSockets.Connection (Connection)
 import           Text.Hex                      (decodeHex, encodeHex)
 
-handleMessage :: Connection -> Text -> IO ()
-handleMessage conn msg = L.log ( "Request received: " <> msg) >> execute conn (T.words msg)
+main :: IO ()
+main = L.withStdoutLogging $ withSocketsDo $ WS.runClient "127.0.0.1" 3000 "/ws" app
 
-execute :: Connection -> [Text] -> IO ()
-execute conn ["search", hash, start, end]
-  = maybe (L.log "Non valid hash received") (crack conn start end) (decodeHex hash)
-  >> loop conn
+app :: WS.ClientApp ()
+app conn
+  = putStrLn "Connected!"
+  >> WS.sendTextData conn ("slave" :: Text)
+  >> listeningLoop conn Nothing
+  >> WS.sendClose conn ("Bye!" :: Text)
 
-execute conn ["stop"]
-  = L.log "wants to stop" >> loop conn
+listeningLoop :: Connection -> Maybe ThreadId -> IO ()
+listeningLoop conn threadId
+  = WS.receiveData conn
+  >>= handleMessage conn threadId
 
-execute conn ["exit"]
-  = L.log "wants to exit"
+handleMessage :: Connection -> Maybe ThreadId  -> Text -> IO ()
+handleMessage conn threadId msg
+  = L.log ( "Request received: " <> msg)
+  >> execute conn threadId (T.words msg)
 
-execute conn _
-  = L.log "error" >> loop conn
+execute :: Connection -> Maybe ThreadId -> [Text] -> IO ()
+execute conn threadId ["search", hash, start, end]
+  = forM_ threadId killThread
+  >> maybe (Nothing <$ L.log "Non valid hash received") (fmap Just . forkIO . crack conn start end) (decodeHex hash)
+  >>= listeningLoop conn
 
-loop :: Connection -> IO ()
-loop conn = WS.receiveData conn >>= handleMessage conn
+execute conn Nothing ["stop"]
+  = L.log "Nothing to stop"
+  >> listeningLoop conn Nothing
+
+execute conn (Just threadId) ["stop"]
+  = L.log "Wants to stop"
+  >> killThread threadId
+  >> listeningLoop conn Nothing
+
+execute conn threadId ["exit"] = L.log "wants to exit"
+
+execute conn threadId _
+  = L.log "error"
+  >> listeningLoop conn threadId
 
 crack :: Connection -> Text -> Text -> B.ByteString -> IO ()
-crack conn start end hash =
-  L.log ( "cracking " <> encodeHex hash <>  " on [" <>  start <> ";" <> end <> ")...")
+crack conn start end hash
+  = L.log ( "cracking " <> encodeHex hash <>  " on [" <>  start <> ";" <> end <> ")...")
   >>  maybe (L.log "No solution found!") (found conn hash) (crackLoop hash (T.unpack start) (T.unpack end))
 
 found :: Connection -> B.ByteString -> Text -> IO ()
@@ -51,20 +72,6 @@ crackLoop hash start end
   | start == end = Nothing
   | MD5.hash (toByteString start) == hash = Just (T.pack start)
   | otherwise = crackLoop hash (incrementWord start) end
-
-app :: WS.ClientApp ()
-app conn = putStrLn "Connected!"
-  >> WS.sendTextData conn ("slave" :: Text)
-  >> loop conn
-  >> WS.sendClose conn ("Bye!" :: Text)
-
-lol :: Text
-lol = "lol" <> "lil"
-
-main :: IO ()
-main = L.withStdoutLogging $ withSocketsDo $ WS.runClient "127.0.0.1" 3000 "/ws" app
-
-alphabet = [ 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9']
 
 toByteString :: String -> B.ByteString
 toByteString text = B.pack $ fmap (toEnum . ord) text
